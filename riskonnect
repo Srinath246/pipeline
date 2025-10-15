@@ -1,0 +1,224 @@
+pipeline {
+    agent any
+  options { timestamps() }
+
+  parameters {
+    string(name: 'TARGET_SERVERS', defaultValue: '172.26.40.152,172.26.40.153', description: 'Comma-separated IPs/FQDNs')
+    string(name: 'SHARE_FILE', defaultValue: '\\\\1062589-DANSQA\\devsource\\BI_Tools\\BI_Client\\BO4_3.exe', description: 'UNC to BO4_3.exe')
+    string(name: 'DEST_DIR', defaultValue: 'D:\\Builds_BIClientInstall', description: 'Staging folder on target')
+    string(name: 'DOMAIN_USER', defaultValue: 'starbase\\teamcitysrvacct', description: 'Domain\\User')
+    password(name: 'DOMAIN_PWD', defaultValue: 'Stars4me', description: 'Password for DOMAIN_USER')
+    booleanParam(name: 'REBOOT_AFTER_INSTALL', defaultValue: true, description: 'Reboot after install')
+  }
+
+  environment {
+    LOCAL_LOGS = "${env.WORKSPACE}\\collected-logs"
+  }
+
+  stages {
+
+    stage('Stage 1: Copy BO4_3.exe to target & sleep 1 min') {
+      steps {
+        powershell '''
+$ErrorActionPreference = "Stop"
+
+function New-PSCredential([string]$u,[string]$p){[pscredential]::new($u,(ConvertTo-SecureString $p -AsPlainText -Force))}
+function Ensure-Dir($p){ if(!(Test-Path $p)){ New-Item -ItemType Directory -Force -Path $p | Out-Null } }
+
+$servers = ($env:TARGET_SERVERS -split ',') | ForEach-Object { $_.Trim() } | Where-Object {$_}
+$cred    = New-PSCredential $env:DOMAIN_USER $env:DOMAIN_PWD
+$share   = $env:SHARE_FILE
+$dest    = $env:DEST_DIR
+
+foreach($s in $servers){
+  Write-Host "==> [$s] Copying $share -> $dest\\BO4_3.exe"
+  $sess = New-PSSession -ComputerName $s -Credential $cred -Authentication Negotiate
+  try{
+    Invoke-Command -Session $sess -ScriptBlock {
+      param($dest,$share,$user,$pwd)
+      $ErrorActionPreference = "Stop"
+
+      if(!(Test-Path $dest)){ New-Item -ItemType Directory -Force -Path $dest | Out-Null }
+      $logs = Join-Path $dest 'logs'; if(!(Test-Path $logs)){ New-Item -ItemType Directory -Force -Path $logs | Out-Null }
+
+      # Map share with creds as a temporary PSDrive, then copy
+      $root = Split-Path -Parent $share
+      $file = Split-Path -Leaf   $share
+      $drive = "Z$([int](Get-Random -Maximum 9999))"
+      $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
+      $cr  = [pscredential]::new($user,$sec)
+      New-PSDrive -Name $drive -PSProvider FileSystem -Root $root -Credential $cr | Out-Null
+      try { Copy-Item -Path ("{0}:\\{1}" -f $drive,$file) -Destination (Join-Path $dest 'BO4_3.exe') -Force }
+      finally { Remove-PSDrive -Name $drive -Force -ErrorAction SilentlyContinue }
+    } -ArgumentList $dest,$share,$env:DOMAIN_USER,$env:DOMAIN_PWD
+  }
+  finally { if($sess){ Remove-PSSession $sess } }
+  Write-Host "==> [$s] Copy complete. Sleeping 60s..."
+}
+Start-Sleep -Seconds 60
+'''
+      }
+    }
+
+    stage('Stage 2: Reboot target & wait until back') {
+      steps {
+        powershell '''
+$ErrorActionPreference = "Stop"
+function New-PSCredential([string]$u,[string]$p){[pscredential]::new($u,(ConvertTo-SecureString $p -AsPlainText -Force))}
+function Wait-ForWinRM($computer,$timeoutSec=900){
+  $sw=[Diagnostics.Stopwatch]::StartNew()
+  do{
+    try{ Test-WSMan -ComputerName $computer -ErrorAction Stop | Out-Null; return $true } catch { Start-Sleep 5 }
+  } while($sw.Elapsed.TotalSeconds -lt $timeoutSec)
+  return $false
+}
+
+$servers = ($env:TARGET_SERVERS -split ',') | ForEach-Object { $_.Trim() } | Where-Object {$_}
+$cred    = New-PSCredential $env:DOMAIN_USER $env:DOMAIN_PWD
+
+foreach($s in $servers){
+  Write-Host "==> [$s] Issuing reboot..."
+  try {
+    Invoke-Command -ComputerName $s -Credential $cred -ScriptBlock { shutdown /r /f /t 0 } -Authentication Negotiate
+  } catch { Write-Warning "Reboot command error (ignoring): $_" }
+  Write-Host "==> [$s] Waiting for it to go down and come back..."
+  Start-Sleep 10
+  if(!(Wait-ForWinRM -computer $s -timeoutSec 900)){ throw "[$s] did not come back on WinRM within timeout." }
+  Write-Host "==> [$s] Back online."
+}
+'''
+      }
+    }
+
+    stage('Stage 3: Silent install & collect/show logs') {
+      steps {
+        powershell '''
+$ErrorActionPreference = "Stop"
+
+function New-PSCredential([string]$u,[string]$p){[pscredential]::new($u,(ConvertTo-SecureString $p -AsPlainText -Force))}
+function Ensure-Dir($p){ if(!(Test-Path $p)){ New-Item -ItemType Directory -Force -Path $p | Out-Null } }
+
+$servers = ($env:TARGET_SERVERS -split ',') | ForEach-Object { $_.Trim() } | Where-Object {$_}
+$cred    = New-PSCredential $env:DOMAIN_USER $env:DOMAIN_PWD
+$dest    = $env:DEST_DIR
+Ensure-Dir $env:LOCAL_LOGS
+
+$remoteInstall = {
+  param($dest)
+  $ErrorActionPreference = "Stop"
+  $pkg  = Join-Path $dest 'BO4_3.exe'
+  $logs = Join-Path $dest 'logs'
+  if(!(Test-Path $logs)){ New-Item -ItemType Directory -Force -Path $logs | Out-Null }
+  $main = Join-Path $logs ("install_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+  function Invoke-Logged([string]$f,[string]$a,[string]$m){ 
+    "$f $a" | Out-File -FilePath $m -Append -Encoding utf8
+    $p = Start-Process -FilePath $f -ArgumentList $a -Wait -PassThru
+    "ExitCode=$($p.ExitCode)" | Out-File -FilePath $m -Append -Encoding utf8
+    return $p.ExitCode
+  }
+
+  # Try to extract MSIs first (more reliable), else fall back to wrapper silent
+  $extractDir = Join-Path $dest 'extracted'
+  if(!(Test-Path $extractDir)){ New-Item -ItemType Directory -Force -Path $extractDir | Out-Null }
+  $extracted = $false
+  try {
+    Start-Process -FilePath $pkg -ArgumentList "/extract:`"$extractDir`"" -Wait -PassThru | Out-Null
+    if(Get-ChildItem $extractDir -Recurse -Include *.msi,*.msp){ $extracted = $true }
+  } catch {}
+
+  $exit = 0
+  if($extracted){
+    $msis = Get-ChildItem $extractDir -Recurse -Filter *.msi
+    foreach($msi in $msis){
+      $log = Join-Path $logs ("msi_{0}.log" -f $msi.BaseName)
+      $args = "/i `"$($msi.FullName)`" ALLUSERS=1 /qn /norestart /L*v `"$log`""
+      $ec = Invoke-Logged "msiexec.exe" $args $main
+      if($ec -ne 0){ $exit = $ec; break }
+    }
+    if($exit -eq 0){
+      $msp = Get-ChildItem $extractDir -Recurse -Filter *.msp | Select-Object -First 1
+      if($msp){
+        $logP = Join-Path $logs ("msp_{0}.log" -f $msp.BaseName)
+        $argsP = "/p `"$($msp.FullName)`" /qn /norestart /L*v `"$logP`""
+        $exit = Invoke-Logged "msiexec.exe" $argsP $main
+      }
+    }
+  } else {
+    # Common installer flags; adjust if your media shows different help.
+    $setupLog = Join-Path $logs 'setup_wrapper.log'
+    $args = "/silent /norestart /log=`"$setupLog`""
+    $exit = Invoke-Logged $pkg $args $main
+  }
+
+  # Return both exit code and path to logs
+  [pscustomobject]@{ ExitCode = $exit; LogsDir = $logs; MainLog = $main }
+}
+
+foreach($s in $servers){
+  Write-Host "==> [$s] Starting silent install..."
+  $result = Invoke-Command -ComputerName $s -Credential $cred -Authentication Negotiate -ScriptBlock $remoteInstall -ArgumentList $dest
+  $exit   = [int]$result.ExitCode
+  $rLogs  = [string]$result.LogsDir
+  $rMain  = [string]$result.MainLog
+
+  # Pull logs to Jenkins for this server
+  $localDir = Join-Path $env:LOCAL_LOGS $s.Replace(':','_')
+  Ensure-Dir $localDir
+  $sess = New-PSSession -ComputerName $s -Credential $cred -Authentication Negotiate
+  try {
+    Copy-Item -FromSession $sess -Path (Join-Path $rLogs '*') -Destination $localDir -Recurse -Force
+  } finally { if($sess){ Remove-PSSession $sess } }
+
+  Write-Host "==> [$s] Install exit code: $exit"
+  Write-Host "----- [$s] Tail of main log ($rMain) -----"
+  $tailFile = Join-Path $localDir (Split-Path $rMain -Leaf)
+  if(Test-Path $tailFile){ Get-Content $tailFile -Tail 80 | %{ Write-Host $_ } }
+
+  # Persist for next stage
+  "$s,$exit" | Out-File -FilePath "$env.WORKSPACE\\install-exitcodes.csv" -Append -Encoding utf8
+}
+'''
+      }
+    }
+
+    stage('Stage 4: Verify exit codes & reboot after install') {
+      steps {
+        powershell '''
+$ErrorActionPreference = "Stop"
+function New-PSCredential([string]$u,[string]$p){[pscredential]::new($u,(ConvertTo-SecureString $p -AsPlainText -Force))}
+
+# Read exit codes
+$map = @{}
+Get-Content "$env:WORKSPACE\\install-exitcodes.csv" | ForEach-Object {
+  $p = $_.Split(',')
+  if($p.Length -ge 2){ $map[$p[0]] = [int]$p[1] }
+}
+$failed = @()
+$servers = $map.Keys
+foreach($s in $servers){
+  if($map[$s] -ne 0){ $failed += "$s (ExitCode=$($map[$s]))" }
+}
+if($failed.Count -gt 0){
+  Write-Error ("Install failures: " + ($failed -join '; '))
+}
+
+# Optional reboot after successful install
+if("${env:REBOOT_AFTER_INSTALL}" -eq 'true'){
+  $cred = New-PSCredential $env:DOMAIN_USER $env:DOMAIN_PWD
+  foreach($s in $servers){
+    Write-Host "==> [$s] Rebooting after install..."
+    try{ Invoke-Command -ComputerName $s -Credential $cred -ScriptBlock { shutdown /r /f /t 0 } -Authentication Negotiate } catch { Write-Warning $_ }
+  }
+}
+'''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'collected-logs/**/*', fingerprint: true, onlyIfSuccessful: false
+    }
+  }
+}
